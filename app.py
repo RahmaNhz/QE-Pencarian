@@ -1,106 +1,197 @@
-from flask import Flask, render_template, request, redirect, url_for
-from model_loader import load_model_and_search
-from model_labels import MODEL_LABELS
-import json
+import streamlit as st
+import pandas as pd
+import numpy as np
+import re
 import os
 
-app = Flask(__name__)
+from PIL import Image
+from gensim.models import Word2Vec
+from nltk.corpus import stopwords
+from rank_bm25 import BM25Plus
+import nltk
 
-RELEVANSI_FILE = 'data/relevansi.json'
+# ======================
+# CONFIG
+# ======================
 
-@app.route("/", methods=["GET", "POST"])
-def index():
-    results = []
-    expanded_query = []
-    query = ""
-    mode = ""
-    selected_model_label = ""
+st.set_page_config(
+    page_title="Pencarian Berita",
+    page_icon="📰",
+    layout="wide"
+)
 
-    if request.method == "POST":
-        query = request.form["query"]
-        model_name = request.form["model"]
-        mode = request.form["mode"]
+nltk.download("stopwords")
 
-        search_result = load_model_and_search(query, model_name, mode)
-        expanded_query = search_result["expanded_query"]
-        results = search_result["results"]
+# ======================
+# LOAD FILE
+# ======================
 
-        selected_model_label = MODEL_LABELS.get(model_name, model_name)
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
-    return render_template("index.html", results=results, expanded_query=expanded_query, query=query, mode=mode, selected_model_label=selected_model_label)
+DATASET = os.path.join(BASE_DIR, "Dataset-STR.csv")
+MODEL = os.path.join(BASE_DIR, "ujimodelgr-300-9-0.01.model")
+IMAGE = os.path.join(BASE_DIR, "berita3.jpg")
 
-@app.route("/simpan_relevansi", methods=["POST"])
-def simpan_relevansi():
-    query = request.form.get("query")
-    model = request.form.get("model")
-    data = request.form.to_dict()
+df = pd.read_csv(DATASET)
 
-    relevan = []
-    tidak_relevan = []
+stop_words = set(stopwords.words("indonesian"))
 
-    for k, v in data.items():
-        if k.startswith("relevansi_"):
-            doc_id = k.split("_")[1]
-            if v == "relevan":
-                relevan.append(doc_id)
-            elif v == "tidak":
-                tidak_relevan.append(doc_id)
+model = Word2Vec.load(MODEL)
 
-    simpanan = {
-        "query": query,
-        "model": model,
-        "dokumen_relevan": relevan,
-        "dokumen_tidak_relevan": tidak_relevan,
-        "total_relevan": len(relevan),
-        "total_tidak_relevan": len(tidak_relevan)
-    }
+# ======================
+# PREPROCESSING
+# ======================
 
-    # Load file lama
-    if os.path.exists(RELEVANSI_FILE):
-        with open(RELEVANSI_FILE, "r") as f:
-            all_data = json.load(f)
+def case_folding(text):
+    return text.lower()
+
+
+def tokenizing(text):
+    return re.findall(r"\b\w+\b", text)
+
+
+def stopword_removal(tokens):
+    return [t for t in tokens if t not in stop_words]
+
+
+def preprocess_text(text):
+    text = case_folding(text)
+    tokens = tokenizing(text)
+    tokens = stopword_removal(tokens)
+    return tokens
+
+
+# ======================
+# QUERY EXPANSION
+# ======================
+
+def expand_query(query_tokens, topn=5):
+
+    valid = [w for w in query_tokens if w in model.wv]
+
+    if len(valid) == 0:
+        return query_tokens, []
+
+    if len(valid) == 1:
+        similar = model.wv.most_similar(valid[0], topn=topn * 2)
     else:
-        all_data = []
+        vectors = [model.wv[w] for w in valid]
+        avg = np.mean(vectors, axis=0)
+        similar = model.wv.most_similar(avg, topn=topn * 2)
 
-    all_data.append(simpanan)
+    tambahan = []
+    skor = []
 
-    with open(RELEVANSI_FILE, "w") as f:
-        json.dump(all_data, f, indent=2)
+    for w, s in similar:
 
-    return redirect(url_for("lihat_relevansi"))
+        if (
+            w not in valid
+            and w not in stop_words
+            and w not in tambahan
+        ):
+            tambahan.append(w)
+            skor.append(s)
 
-# Placeholder route untuk melihat hasil
-@app.route("/lihat_relevansi")
-def lihat_relevansi():
-    if os.path.exists(RELEVANSI_FILE):
-        with open(RELEVANSI_FILE, "r") as f:
-            data = json.load(f)
-    else:
-        data = []
+        if len(tambahan) >= topn:
+            break
 
-    return render_template("relevansi.html", data=data)
-
-#------Route untuk menghapus----#
-@app.route("/relevansi/hapus/<int:index>")
-def hapus_relevansi(index):
-    # Misalnya kamu simpan relevansi di file JSON
-    with open("data/relevansi.json", "r") as f:
-        data = json.load(f)
-
-    if 0 <= index < len(data):
-        data.pop(index)
-
-        with open("data/relevansi.json", "w") as f:
-            json.dump(data, f, indent=4)
-
-    return redirect(url_for("lihat_relevansi"))
-
-if __name__ == '__main__':
-    app.run(debug=False, host='0.0.0.0', port=5000)
+    return valid + tambahan, list(zip(tambahan, skor))
 
 
+# ======================
+# HEADER
+# ======================
 
+st.title("📰 Sistem Pencarian Dokumen Berita")
 
+st.write(
+"""
+Sistem menggunakan
 
+- Skip-Gram Word2Vec
+- Query Expansion
+- BM25+
 
+untuk meningkatkan relevansi pencarian berita.
+"""
+)
 
+if os.path.exists(IMAGE):
+    image = Image.open(IMAGE)
+    st.image(image, width=600)
+
+st.divider()
+
+# ======================
+# INPUT QUERY
+# ======================
+
+query = st.text_input(
+    "Masukkan kata kunci pencarian",
+    placeholder="contoh: pajak"
+)
+
+if st.button("🔍 Cari Berita"):
+
+    if query.strip() == "":
+        st.warning("Masukkan query terlebih dahulu.")
+        st.stop()
+
+    tokens = preprocess_text(query)
+
+    expanded_query, similar_words = expand_query(tokens)
+
+    st.subheader("Hasil Query Expansion")
+
+    st.write("Query awal :", tokens)
+
+    st.write("Query setelah ekspansi :", expanded_query)
+
+    if len(similar_words):
+
+        st.table(
+            pd.DataFrame(
+                similar_words,
+                columns=["Kata", "Skor Similarity"]
+            )
+        )
+
+    st.divider()
+
+    corpus = df["berita"].astype(str).tolist()
+
+    tokenized = [
+        tokenizing(doc.lower())
+        for doc in corpus
+    ]
+
+    bm25 = BM25Plus(tokenized)
+
+    scores = bm25.get_scores(expanded_query)
+
+    top = np.argsort(scores)[::-1][:10]
+
+    st.subheader("Top 10 Berita")
+
+    for i in top:
+
+        row = df.iloc[i]
+
+        st.markdown(f"### {row['judul']}")
+
+        c1, c2 = st.columns(2)
+
+        c1.write(f"📅 {row['tanggal']}")
+
+        c2.write(f"🏷️ {row['kategori']}")
+
+        st.write(row["berita"][:400] + "...")
+
+        st.write(f"**Skor BM25+ : {scores[i]:.4f}**")
+
+        st.link_button(
+            "Buka Berita",
+            row["link"]
+        )
+
+        st.divider()
